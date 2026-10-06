@@ -355,5 +355,192 @@ class IndependentSourceTests(unittest.TestCase):
         self.assertGreaterEqual(elapsed, 0.20)
 
 
+class CycleMetricsTests(unittest.TestCase):
+    def setUp(self) -> None:
+        self.tmp = tempfile.TemporaryDirectory()
+        os.environ["LISTING_NEWS_PAPER_CACHE"] = self.tmp.name
+        self.addCleanup(self.tmp.cleanup)
+        self.addCleanup(lambda: os.environ.pop("LISTING_NEWS_PAPER_CACHE", None))
+
+    def _cycles(self) -> list:
+        path = Path(self.tmp.name, "cycles.jsonl")
+        if not path.exists():
+            return []
+        return [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+
+    def test_parse_retry_after(self) -> None:
+        self.assertEqual(m.parse_retry_after("120"), 120.0)
+        self.assertEqual(m.parse_retry_after("0"), 0.0)
+        self.assertIsNone(m.parse_retry_after(""))
+        self.assertIsNone(m.parse_retry_after(None))
+        self.assertIsNone(m.parse_retry_after("nope"))
+        self.assertEqual(m.cap_retry_after(99999.0), m.RETRY_AFTER_CAP_S)
+        from datetime import datetime, timedelta, timezone
+        from email.utils import format_datetime
+
+        now = 1_700_000_000.0
+        dt = datetime.fromtimestamp(now, tz=timezone.utc) + timedelta(seconds=30)
+        got = m.parse_retry_after(format_datetime(dt, usegmt=True), now=now)
+        self.assertIsNotNone(got)
+        self.assertAlmostEqual(got or 0.0, 30.0, delta=1.0)
+
+    def test_schedule_next_due_uses_retry_after_and_backoff(self) -> None:
+        started = 100.0
+        received = 101.0
+        due = m.schedule_next_due(started, received, 15.0, 0, None)
+        self.assertEqual(due, 115.0)
+        due_err = m.schedule_next_due(started, received, 15.0, 1, None)
+        self.assertEqual(due_err, 130.0)
+        due_ra = m.schedule_next_due(started, received, 15.0, 1, 60.0)
+        self.assertEqual(due_ra, 161.0)
+        due_cap = m.schedule_next_due(started, received, 15.0, 1, 99999.0)
+        self.assertEqual(due_cap, received + m.RETRY_AFTER_CAP_S)
+
+    def test_empty_poll_records_http_ms(self) -> None:
+        def fetch(_client):
+            return m.FetchResult(
+                source_id="coinbase_currencies",
+                items=[],
+                status_code=200,
+                http_ms=12.5,
+                received_at=time.monotonic(),
+                error=None,
+                retry_after_s=None,
+            )
+
+        sources = [_source("coinbase_currencies", "coinbase", fetch)]
+        seen = {"ids": [], "seeded": ["coinbase_currencies"]}
+        events = m.run_once(seen, emit_skip=False, sources=sources)
+        self.assertEqual(events, [])
+        recs = self._cycles()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["kind"], "cycle")
+        self.assertEqual(recs[0]["http_ms"], 12.5)
+        self.assertEqual(recs[0]["status_code"], 200)
+        self.assertEqual(recs[0]["fetched"], 0)
+        self.assertEqual(recs[0]["error"], None)
+        self.assertIn("cycle_elapsed_s", recs[0])
+        self.assertIsNone(recs[0]["start_interval_s"])
+
+    def test_start_interval_is_previous_start_gap(self) -> None:
+        starts = []
+
+        def fetch(_client):
+            starts.append(time.monotonic())
+            time.sleep(0.03)
+            return m.FetchResult("bybit", [], 200, 5.0, time.monotonic(), None, None)
+
+        sources = [_source("bybit", "bybit", fetch)]
+        seen = m.SeenState(seeded=["bybit"])
+        m.run_scheduler(
+            loops=2,
+            interval=0.08,
+            emit_skip=False,
+            sources=sources,
+            seen=seen,
+        )
+        recs = self._cycles()
+        self.assertEqual(len(recs), 2)
+        self.assertIsNone(recs[0]["start_interval_s"])
+        self.assertGreaterEqual(recs[1]["start_interval_s"], 0.07)
+        self.assertAlmostEqual(recs[1]["start_interval_s"], starts[1] - starts[0], delta=0.03)
+
+    def test_retry_after_delays_next_fetch(self) -> None:
+        calls = {"n": 0}
+
+        def boom(_client):
+            calls["n"] += 1
+            return m.FetchResult("bybit", [], 429, 1.0, time.monotonic(), "Bybit 429", 0.18)
+
+        sources = [_source("bybit", "bybit", boom)]
+        seen = m.SeenState(seeded=["bybit"])
+        t0 = time.monotonic()
+        m.run_scheduler(
+            loops=2,
+            interval=0.04,
+            emit_skip=False,
+            sources=sources,
+            seen=seen,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(calls["n"], 2)
+        self.assertGreaterEqual(elapsed, 0.18)
+        recs = self._cycles()
+        self.assertEqual(recs[0]["status_code"], 429)
+        self.assertEqual(recs[0]["retry_after_s"], 0.18)
+        self.assertGreaterEqual(recs[0]["consecutive_errors"], 1)
+
+    def test_consecutive_errors_lengthen_wait(self) -> None:
+        calls = {"n": 0}
+
+        def boom(_client):
+            calls["n"] += 1
+            raise RuntimeError("Bybit down")
+
+        sources = [_source("bybit", "bybit", boom)]
+        seen = m.SeenState(seeded=["bybit"])
+        t0 = time.monotonic()
+        m.run_scheduler(
+            loops=2,
+            interval=0.05,
+            emit_skip=False,
+            sources=sources,
+            seen=seen,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(calls["n"], 2)
+        # first error: 2x interval from start before the second attempt
+        self.assertGreaterEqual(elapsed, 0.10)
+        recs = self._cycles()
+        self.assertEqual([r["consecutive_errors"] for r in recs], [1, 2])
+
+    def test_429_does_not_seed(self) -> None:
+        def boom(_client):
+            return m.FetchResult("bybit", [], 429, 3.0, time.monotonic(), "Bybit 429", 1.0)
+
+        sources = [_source("bybit", "bybit", boom)]
+        seen = {"ids": [], "seeded": []}
+        events = m.run_once(seen, emit_skip=False, sources=sources)
+        self.assertEqual(events, [])
+        self.assertEqual(seen["seeded"], [])
+
+    def test_judge_and_emit_ms_are_split(self) -> None:
+        item = _item("bybit", "upcoming listing of FOO (FOO)", "https://example.com/x")
+        item["t_http_start"] = time.monotonic() - 0.02
+        item["t_http_end"] = time.monotonic() - 0.01
+        ev = m.paper_event(item)
+        self.assertIsNotNone(ev["timing"]["http_ms"])
+        self.assertIsNotNone(ev["timing"]["judge_ms"])
+        self.assertIsNone(ev["timing"]["emit_ms"])
+        self.assertNotIn("process_ms", ev["timing"])
+
+        seen = m.SeenState(seeded=["bybit"])
+        emitted = []
+
+        def on_event(_ev):
+            time.sleep(0.05)
+            emitted.append(_ev)
+
+        events = m.ingest_source("bybit", [item], seen, False, on_event)
+        self.assertEqual(len(events), 1)
+        self.assertGreaterEqual(events[0]["timing"]["emit_ms"], 45.0)
+        self.assertEqual(len(emitted), 1)
+
+    def test_http_json_reads_retry_after(self) -> None:
+        class Resp:
+            status_code = 429
+            text = "{}"
+            headers = {"Retry-After": "42"}
+
+        class Client:
+            def get(self, url, timeout=None):
+                return Resp()
+
+        code, data, t0, t1, retry_after_s = m.http_json(Client(), "https://example.invalid/")
+        self.assertEqual(code, 429)
+        self.assertEqual(retry_after_s, 42.0)
+        self.assertGreaterEqual(t1, t0)
+
+
 if __name__ == "__main__":
     unittest.main()
