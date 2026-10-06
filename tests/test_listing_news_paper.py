@@ -374,7 +374,9 @@ class CycleMetricsTests(unittest.TestCase):
         self.assertIsNone(m.parse_retry_after(""))
         self.assertIsNone(m.parse_retry_after(None))
         self.assertIsNone(m.parse_retry_after("nope"))
-        self.assertEqual(m.cap_retry_after(99999.0), m.RETRY_AFTER_CAP_S)
+        self.assertFalse(m.should_pause_retry_after(3600.0))
+        self.assertTrue(m.should_pause_retry_after(99999.0))
+        self.assertTrue(m.should_pause_retry_after(m.RETRY_AFTER_PAUSE_S))
         from datetime import datetime, timedelta, timezone
         from email.utils import format_datetime
 
@@ -393,8 +395,10 @@ class CycleMetricsTests(unittest.TestCase):
         self.assertEqual(due_err, 130.0)
         due_ra = m.schedule_next_due(started, received, 15.0, 1, 60.0)
         self.assertEqual(due_ra, 161.0)
-        due_cap = m.schedule_next_due(started, received, 15.0, 1, 99999.0)
-        self.assertEqual(due_cap, received + m.RETRY_AFTER_CAP_S)
+        due_hour = m.schedule_next_due(started, received, 15.0, 1, 3600.0)
+        self.assertEqual(due_hour, 3701.0)
+        due_pause = m.schedule_next_due(started, received, 15.0, 1, 99999.0)
+        self.assertEqual(due_pause, 130.0)
 
     def test_empty_poll_records_http_ms(self) -> None:
         def fetch(_client):
@@ -540,6 +544,100 @@ class CycleMetricsTests(unittest.TestCase):
         self.assertEqual(code, 429)
         self.assertEqual(retry_after_s, 42.0)
         self.assertGreaterEqual(t1, t0)
+
+    def test_long_retry_after_pauses_instead_of_early_refetch(self) -> None:
+        calls = {"n": 0}
+
+        def boom(_client):
+            calls["n"] += 1
+            return m.FetchResult("bybit", [], 429, 1.0, time.monotonic(), "Bybit 429", 99999.0)
+
+        sources = [_source("bybit", "bybit", boom)]
+        seen = m.SeenState(seeded=["bybit"])
+        t0 = time.monotonic()
+        m.run_scheduler(
+            loops=3,
+            interval=0.04,
+            emit_skip=False,
+            sources=sources,
+            seen=seen,
+        )
+        elapsed = time.monotonic() - t0
+        self.assertEqual(calls["n"], 1)
+        self.assertLess(elapsed, 1.0)
+        recs = self._cycles()
+        self.assertEqual(len(recs), 1)
+        self.assertEqual(recs[0]["retry_after_s"], 99999.0)
+        self.assertEqual(recs[0]["paused"], 1)
+        self.assertIsNone(recs[0]["next_wait_s"])
+
+    def test_http_error_keeps_hour_retry_after(self) -> None:
+        rec = m._http_error("bybit", 429, 1.0, 1.2, "Bybit 429", 3600.0)
+        self.assertEqual(rec.retry_after_s, 3600.0)
+        self.assertFalse(m.should_pause_retry_after(rec.retry_after_s))
+
+    def test_on_event_exception_still_logs_and_continues(self) -> None:
+        payloads = [
+            [{"id": "BTC", "status": "online"}],
+            [
+                {"id": "BTC", "status": "online"},
+                {"id": "FOO", "status": "online"},
+            ],
+            [
+                {"id": "BTC", "status": "online"},
+                {"id": "FOO", "status": "online"},
+            ],
+        ]
+        idx = {"n": 0}
+
+        def fake_http_json(client, url, timeout=15.0):
+            t0 = time.monotonic()
+            body = payloads[min(idx["n"], len(payloads) - 1)]
+            idx["n"] += 1
+            return 200, body, t0, time.monotonic(), None
+
+        orig = m.http_json
+        m.http_json = fake_http_json
+        self.addCleanup(lambda: setattr(m, "http_json", orig))
+
+        bybit_item = _item("bybit", "upcoming listing of BAR (BAR)", "https://example.com/bar")
+
+        def fetch_bybit(_client):
+            return [bybit_item]
+
+        def on_event(ev):
+            if ev["source_id"] == "coinbase_currencies":
+                raise RuntimeError("notify failed")
+
+        sources = [
+            _source("coinbase_currencies", "coinbase", m.fetch_coinbase_currencies),
+            _source("bybit", "bybit", fetch_bybit),
+        ]
+        seen = m.SeenState(seeded=["coinbase_currencies", "bybit"])
+        events = m.run_scheduler(
+            loops=3,
+            interval=0.02,
+            emit_skip=False,
+            sources=sources,
+            seen=seen,
+            on_event=on_event,
+        )
+        cb_events = [e for e in events if e["source_id"] == "coinbase_currencies"]
+        bybit_events = [e for e in events if e["source_id"] == "bybit"]
+        self.assertEqual(len(cb_events), 1)
+        self.assertEqual(cb_events[0]["tickers"], ["FOO"])
+        self.assertEqual(cb_events[0]["notify_error"], "notify failed")
+        self.assertIsNotNone(cb_events[0]["timing"]["emit_ms"])
+        self.assertEqual(len(bybit_events), 1)
+
+        event_path = Path(self.tmp.name, "events.jsonl")
+        logged = [json.loads(line) for line in event_path.read_text().splitlines() if line.strip()]
+        self.assertEqual(sum(1 for e in logged if e["source_id"] == "coinbase_currencies"), 1)
+        recs = self._cycles()
+        cb_cycles = [r for r in recs if r["source_id"] == "coinbase_currencies"]
+        self.assertEqual(len(cb_cycles), 3)
+        self.assertEqual(sum(r["notify_errors"] for r in cb_cycles), 1)
+        self.assertGreaterEqual(len([r for r in recs if r["source_id"] == "bybit"]), 1)
 
 
 if __name__ == "__main__":

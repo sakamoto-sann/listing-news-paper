@@ -26,7 +26,7 @@ python3 -u listing_news_paper.py --loops 240 --interval 15
 
 Cache defaults to `~/.hermes/cache/listing-news-paper`. Override with `LISTING_NEWS_PAPER_CACHE`. Cycle rows go to `cycles.jsonl` (empty polls included). Events stay in `events.jsonl`.
 
-CLI interval floor is 15 seconds, measured start-to-start per source. Default is still 30 seconds; pass `--interval 15` to use the floor. `--once` fetches each source once and exits. One IP. No proxies. A 429 skips that source for the attempt, honors `Retry-After` (capped at 900s), and backs off on consecutive errors. It does not retry-hammer.
+CLI interval floor is 15 seconds, measured start-to-start per source. Default is still 30 seconds; pass `--interval 15` to use the floor. `--once` fetches each source once and exits. One IP. No proxies. A 429 skips that source for the attempt, waits the server `Retry-After` (RFC 9110, including 3600s), and backs off on consecutive errors (2x…16x interval). `Retry-After` of 24h or more pauses that source instead of refetching early. It does not retry-hammer. `on_event` exceptions are recorded as `notify_error`; the event and cycle logs still write.
 
 ## Paper contract
 

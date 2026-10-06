@@ -61,7 +61,7 @@ def cycle_log_path() -> Path:
 UA = "listing-news-paper/1.0"
 MIN_INTERVAL_SEC = 15.0
 HTTP_TIMEOUT_SEC = 15.0
-RETRY_AFTER_CAP_S = 900.0
+RETRY_AFTER_PAUSE_S = 86400.0
 MAX_ERROR_BACKOFF_FACTOR = 16
 
 BYBIT = "https://api.bybit.com/v5/announcements/index"
@@ -206,10 +206,8 @@ def parse_retry_after(value: Any, now: Optional[float] = None) -> Optional[float
     return max(0.0, dt.timestamp() - float(now))
 
 
-def cap_retry_after(retry_after_s: Optional[float]) -> Optional[float]:
-    if retry_after_s is None:
-        return None
-    return min(max(0.0, float(retry_after_s)), RETRY_AFTER_CAP_S)
+def should_pause_retry_after(retry_after_s: Optional[float]) -> bool:
+    return retry_after_s is not None and float(retry_after_s) >= RETRY_AFTER_PAUSE_S
 
 
 def schedule_next_due(
@@ -223,9 +221,8 @@ def schedule_next_due(
     if consecutive_errors > 0:
         factor = min(2 ** min(consecutive_errors, 4), MAX_ERROR_BACKOFF_FACTOR)
         due = max(due, started + interval * factor)
-    capped = cap_retry_after(retry_after_s)
-    if capped is not None:
-        due = max(due, received_at + capped)
+    if retry_after_s is not None and not should_pause_retry_after(retry_after_s):
+        due = max(due, received_at + max(0.0, float(retry_after_s)))
     return due
 
 
@@ -267,7 +264,7 @@ def _http_error(
         http_ms=_http_ms(t0, t1),
         received_at=t1,
         error=message,
-        retry_after_s=cap_retry_after(retry_after_s),
+        retry_after_s=None if retry_after_s is None else max(0.0, float(retry_after_s)),
     )
 
 
@@ -912,10 +909,16 @@ def ingest_source(
                 title=ev["title"][:100],
             )
         )
-        if on_event is not None:
-            on_event(ev)
+        notify_error = None
+        try:
+            if on_event is not None:
+                on_event(ev)
+        except Exception as e:
+            notify_error = str(e)[:200]
         timing = ev.setdefault("timing", {})
         timing["emit_ms"] = round((time.monotonic() - t_out0) * 1000.0, 3)
+        if notify_error:
+            ev["notify_error"] = notify_error
         events.append(ev)
         _log_event(ev)
     if seeding:
@@ -954,6 +957,8 @@ def _cycle_record(
     start_interval_s: Optional[float],
     consecutive_errors: int,
     next_wait_s: Optional[float],
+    paused: bool = False,
+    notify_errors: int = 0,
 ) -> Dict[str, Any]:
     return {
         "kind": "cycle",
@@ -972,6 +977,8 @@ def _cycle_record(
         "start_interval_s": None if start_interval_s is None else round(start_interval_s, 3),
         "consecutive_errors": consecutive_errors,
         "next_wait_s": None if next_wait_s is None else round(next_wait_s, 3),
+        "paused": int(paused),
+        "notify_errors": notify_errors,
     }
 
 
@@ -1041,15 +1048,20 @@ def run_scheduler(
                 next_wait_s = None
                 if result.error:
                     consecutive_errors[sid] += 1
-                    due = schedule_next_due(
-                        started,
-                        received_at,
-                        interval,
-                        consecutive_errors[sid],
-                        result.retry_after_s,
-                    )
-                    next_due[sid] = due
-                    next_wait_s = due - started
+                    paused = should_pause_retry_after(result.retry_after_s)
+                    next_wait_s = None
+                    if paused:
+                        remaining[sid] = 0
+                    else:
+                        due = schedule_next_due(
+                            started,
+                            received_at,
+                            interval,
+                            consecutive_errors[sid],
+                            result.retry_after_s,
+                        )
+                        next_due[sid] = due
+                        next_wait_s = due - started
                     rec = _cycle_record(
                         source_id=sid,
                         venue=src.venue,
@@ -1062,6 +1074,7 @@ def run_scheduler(
                         start_interval_s=start_interval,
                         consecutive_errors=consecutive_errors[sid],
                         next_wait_s=next_wait_s,
+                        paused=paused,
                     )
                     _log_cycle(rec)
                     _print(
@@ -1092,6 +1105,7 @@ def run_scheduler(
                     start_interval_s=start_interval,
                     consecutive_errors=0,
                     next_wait_s=interval,
+                    notify_errors=sum(1 for e in events if e.get("notify_error")),
                 )
                 _log_cycle(rec)
                 _print(
