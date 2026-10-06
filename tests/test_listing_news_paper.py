@@ -168,6 +168,59 @@ class SeedTests(unittest.TestCase):
         self.assertEqual(m.ingest_source("binance_delist", delist, seen, True), [])
         self.assertTrue(seen.is_seeded("binance_delist"))
 
+    def test_migrates_old_venue_seeds(self) -> None:
+        state = m.SeenState.from_dict(
+            {
+                "ids": ["binance:https://example.com/old:old"],
+                "seeded": ["binance", "bybit", "coinbase", "upbit"],
+            }
+        )
+        self.assertEqual(
+            state.to_dict()["seeded"],
+            [
+                "binance_delist",
+                "binance_listing",
+                "bybit",
+                "coinbase_currencies",
+                "coinbase_status",
+                "upbit",
+            ],
+        )
+        events = m.ingest_source(
+            "binance_listing",
+            [_item("binance", "Will List ZZZ (ZZZ)", "https://example.com/new")],
+            state,
+            False,
+        )
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["tickers"], ["ZZZ"])
+
+    def test_run_once_creates_client_when_sources_omitted(self) -> None:
+        got: dict = {}
+
+        class Dummy:
+            def close(self) -> None:
+                got["closed"] = True
+
+        def fake_make():
+            got["made"] = True
+            return Dummy()
+
+        def fetch(client):
+            got["client"] = client
+            return []
+
+        orig_sources = m.SOURCES
+        orig_make = m.make_client
+        m.SOURCES = (_source("bybit", "bybit", fetch),)
+        m.make_client = fake_make
+        self.addCleanup(lambda: setattr(m, "SOURCES", orig_sources))
+        self.addCleanup(lambda: setattr(m, "make_client", orig_make))
+        m.run_once({"ids": [], "seeded": ["bybit"]}, False)
+        self.assertTrue(got.get("made"))
+        self.assertTrue(got.get("closed"))
+        self.assertIsInstance(got.get("client"), Dummy)
+
 
 class IndependentSourceTests(unittest.TestCase):
     def setUp(self) -> None:

@@ -287,7 +287,7 @@ class SeenState:
             ids = []
         if not isinstance(seeded, list):
             seeded = []
-        return cls(ids, seeded)
+        return cls(ids, migrate_seeded(seeded))
 
     def to_dict(self) -> Dict[str, Any]:
         with self._lock:
@@ -334,7 +334,7 @@ def load_seen() -> Dict[str, Any]:
     seeded = [str(x) for x in seeded]
     if not seeded and ids:
         seeded = sorted({i.split(":")[0] for i in ids if ":" in i})
-    return {"ids": ids, "seeded": seeded}
+    return {"ids": ids, "seeded": migrate_seeded(seeded)}
 
 
 def save_seen(seen: Dict[str, Any]) -> None:
@@ -622,6 +622,22 @@ SOURCES: Tuple[Source, ...] = (
     Source("coinbase_currencies", "coinbase", fetch_coinbase_currencies),
 )
 
+VENUE_SEED_ALIASES = {
+    "binance": ("binance_listing", "binance_delist"),
+    "coinbase": ("coinbase_status", "coinbase_currencies"),
+}
+
+
+def migrate_seeded(seeded: Sequence[str]) -> List[str]:
+    out = set()
+    for name in seeded:
+        aliases = VENUE_SEED_ALIASES.get(str(name))
+        if aliases:
+            out.update(aliases)
+        else:
+            out.add(str(name))
+    return sorted(out)
+
 
 def paper_event(item: Dict[str, Any]) -> Dict[str, Any]:
     title = item["title"]
@@ -814,20 +830,30 @@ def run_once(
     client: HttpClient = None,
     on_event: Optional[Callable[[Dict[str, Any]], None]] = None,
 ) -> List[Dict[str, Any]]:
-    state = SeenState.from_dict(seen)
-    events = run_scheduler(
-        loops=1,
-        interval=0.0,
-        emit_skip=emit_skip,
-        sources=sources,
-        client=client,
-        seen=state,
-        on_event=on_event,
-    )
-    snap = state.to_dict()
-    seen.clear()
-    seen.update(snap)
-    return events
+    own_client = False
+    if client is None and sources is None:
+        client = make_client()
+        own_client = True
+    try:
+        state = SeenState.from_dict(seen)
+        events = run_scheduler(
+            loops=1,
+            interval=0.0,
+            emit_skip=emit_skip,
+            sources=sources,
+            client=client,
+            seen=state,
+            on_event=on_event,
+        )
+        snap = state.to_dict()
+        seen.clear()
+        seen.update(snap)
+        return events
+    finally:
+        if own_client:
+            close = getattr(client, "close", None)
+            if callable(close):
+                close()
 
 
 def selftest() -> int:
