@@ -28,6 +28,7 @@ import urllib.parse
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -53,9 +54,15 @@ def cb_snap_path() -> Path:
     return cache_dir() / "coinbase_currencies.json"
 
 
+def cycle_log_path() -> Path:
+    return cache_dir() / "cycles.jsonl"
+
+
 UA = "listing-news-paper/1.0"
 MIN_INTERVAL_SEC = 15.0
 HTTP_TIMEOUT_SEC = 15.0
+RETRY_AFTER_PAUSE_S = 86400.0
+MAX_ERROR_BACKOFF_FACTOR = 16
 
 BYBIT = "https://api.bybit.com/v5/announcements/index"
 BINANCE_CATALOG = (
@@ -143,6 +150,17 @@ _OUT_LOCK = threading.Lock()
 _SEEN_IO_LOCK = threading.Lock()
 
 
+@dataclass(frozen=True)
+class FetchResult:
+    source_id: str
+    items: List[Dict[str, Any]]
+    status_code: Optional[int] = None
+    http_ms: Optional[float] = None
+    received_at: Optional[float] = None
+    error: Optional[str] = None
+    retry_after_s: Optional[float] = None
+
+
 def make_client() -> HttpClient:
     try:
         import httpx
@@ -161,23 +179,145 @@ def make_client() -> HttpClient:
     )
 
 
+def _http_ms(t0: Any, t1: Any) -> Optional[float]:
+    if isinstance(t0, (int, float)) and isinstance(t1, (int, float)):
+        return round((float(t1) - float(t0)) * 1000.0, 3)
+    return None
+
+
+def parse_retry_after(value: Any, now: Optional[float] = None) -> Optional[float]:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    if text.isdigit():
+        return float(int(text))
+    try:
+        dt = parsedate_to_datetime(text)
+    except (TypeError, ValueError, OverflowError, IndexError):
+        return None
+    if dt is None:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    if now is None:
+        now = time.time()
+    return max(0.0, dt.timestamp() - float(now))
+
+
+def should_pause_retry_after(retry_after_s: Optional[float]) -> bool:
+    return retry_after_s is not None and float(retry_after_s) >= RETRY_AFTER_PAUSE_S
+
+
+def schedule_next_due(
+    started: float,
+    received_at: float,
+    interval: float,
+    consecutive_errors: int,
+    retry_after_s: Optional[float],
+) -> float:
+    due = started + interval
+    if consecutive_errors > 0:
+        factor = min(2 ** min(consecutive_errors, 4), MAX_ERROR_BACKOFF_FACTOR)
+        due = max(due, started + interval * factor)
+    if retry_after_s is not None and not should_pause_retry_after(retry_after_s):
+        due = max(due, received_at + max(0.0, float(retry_after_s)))
+    return due
+
+
 def http_json(
     client: HttpClient, url: str, timeout: float = HTTP_TIMEOUT_SEC
-) -> Tuple[int, Any, float, float]:
+) -> Tuple[int, Any, float, float, Optional[float]]:
     t0 = time.monotonic()
+    retry_after_s = None
     try:
         resp = client.get(url, timeout=timeout)
         t1 = time.monotonic()
         code = int(getattr(resp, "status_code", 0) or 0)
         text = getattr(resp, "text", None) or ""
+        headers = getattr(resp, "headers", None)
+        if headers is not None:
+            retry_after_s = parse_retry_after(headers.get("Retry-After"))
     except Exception as e:
         t1 = time.monotonic()
-        return 0, {"_error": str(e)[:200]}, t0, t1
+        return 0, {"_error": str(e)[:200]}, t0, t1, None
     try:
         parsed = json.loads(text) if text else None
     except json.JSONDecodeError:
         parsed = {"_raw": text[:2000]}
-    return code, parsed, t0, t1
+    return code, parsed, t0, t1, retry_after_s
+
+
+def _http_error(
+    source_id: str,
+    code: int,
+    t0: float,
+    t1: float,
+    message: str,
+    retry_after_s: Optional[float] = None,
+) -> FetchResult:
+    return FetchResult(
+        source_id=source_id,
+        items=[],
+        status_code=code,
+        http_ms=_http_ms(t0, t1),
+        received_at=t1,
+        error=message,
+        retry_after_s=None if retry_after_s is None else max(0.0, float(retry_after_s)),
+    )
+
+
+def _http_ok(
+    source_id: str,
+    items: List[Dict[str, Any]],
+    code: int,
+    t0: float,
+    t1: float,
+) -> FetchResult:
+    return FetchResult(
+        source_id=source_id,
+        items=items,
+        status_code=code,
+        http_ms=_http_ms(t0, t1),
+        received_at=t1,
+        error=None,
+        retry_after_s=None,
+    )
+
+
+def coerce_fetch_result(source_id: str, raw: Any) -> FetchResult:
+    if isinstance(raw, FetchResult):
+        if raw.source_id:
+            return raw
+        return FetchResult(
+            source_id=source_id,
+            items=list(raw.items),
+            status_code=raw.status_code,
+            http_ms=raw.http_ms,
+            received_at=raw.received_at,
+            error=raw.error,
+            retry_after_s=raw.retry_after_s,
+        )
+    if isinstance(raw, list):
+        http_ms = None
+        received_at = None
+        if raw:
+            t0 = raw[0].get("t_http_start")
+            t1 = raw[0].get("t_http_end")
+            http_ms = _http_ms(t0, t1)
+            if isinstance(t1, (int, float)):
+                received_at = float(t1)
+        return FetchResult(
+            source_id=source_id,
+            items=raw,
+            status_code=None,
+            http_ms=http_ms,
+            received_at=received_at,
+            error=None,
+            retry_after_s=None,
+        )
+    raise TypeError("fetch must return FetchResult or list")
 
 
 def extract_tickers(title: str) -> List[str]:
@@ -378,13 +518,20 @@ def _norm_item(
     }
 
 
-def fetch_bybit(client: HttpClient, limit: int = 20) -> List[Dict[str, Any]]:
+def fetch_bybit(client: HttpClient, limit: int = 20) -> FetchResult:
     q = urllib.parse.urlencode({"locale": "en-US", "limit": str(limit)})
-    code, data, t0, t1 = http_json(client, "{}?{}".format(BYBIT, q))
+    code, data, t0, t1, retry_after_s = http_json(client, "{}?{}".format(BYBIT, q))
     if code == 429:
-        raise RuntimeError("Bybit 429")
+        return _http_error("bybit", code, t0, t1, "Bybit 429", retry_after_s)
     if code != 200 or not isinstance(data, dict) or data.get("retCode") != 0:
-        raise RuntimeError("Bybit HTTP {} {}".format(code, str(data)[:180]))
+        return _http_error(
+            "bybit",
+            code,
+            t0,
+            t1,
+            "Bybit HTTP {} {}".format(code, str(data)[:180]),
+            retry_after_s,
+        )
     rows = ((data.get("result") or {}).get("list")) or []
     out: List[Dict[str, Any]] = []
     for it in rows:
@@ -408,7 +555,7 @@ def fetch_bybit(client: HttpClient, limit: int = 20) -> List[Dict[str, Any]]:
                 t1,
             )
         )
-    return out
+    return _http_ok("bybit", out, code, t0, t1)
 
 
 def _fetch_binance_catalog(
@@ -418,15 +565,22 @@ def _fetch_binance_catalog(
     source_id: str,
     event_kind: str,
     limit: int = 20,
-) -> List[Dict[str, Any]]:
+) -> FetchResult:
     q = urllib.parse.urlencode(
         {"catalogId": str(catalog_id), "pageNo": "1", "pageSize": str(limit)}
     )
-    code, data, t0, t1 = http_json(client, "{}?{}".format(BINANCE_CATALOG, q))
+    code, data, t0, t1, retry_after_s = http_json(client, "{}?{}".format(BINANCE_CATALOG, q))
     if code == 429:
-        raise RuntimeError("Binance {} 429".format(source_id))
+        return _http_error(source_id, code, t0, t1, "Binance {} 429".format(source_id), retry_after_s)
     if code != 200 or not isinstance(data, dict) or str(data.get("code")) not in ("000000", "0"):
-        raise RuntimeError("Binance {} HTTP {} {}".format(source_id, code, str(data)[:180]))
+        return _http_error(
+            source_id,
+            code,
+            t0,
+            t1,
+            "Binance {} HTTP {} {}".format(source_id, code, str(data)[:180]),
+            retry_after_s,
+        )
     arts = ((data.get("data") or {}).get("articles")) or []
     out: List[Dict[str, Any]] = []
     for it in arts:
@@ -447,26 +601,33 @@ def _fetch_binance_catalog(
                 t1,
             )
         )
-    return out
+    return _http_ok(source_id, out, code, t0, t1)
 
 
-def fetch_binance_listing(client: HttpClient, limit: int = 20) -> List[Dict[str, Any]]:
+def fetch_binance_listing(client: HttpClient, limit: int = 20) -> FetchResult:
     return _fetch_binance_catalog(client, 48, "new_crypto", "binance_listing", "listing_announcement", limit)
 
 
-def fetch_binance_delist(client: HttpClient, limit: int = 20) -> List[Dict[str, Any]]:
+def fetch_binance_delist(client: HttpClient, limit: int = 20) -> FetchResult:
     return _fetch_binance_catalog(client, 161, "delistings", "binance_delist", "delist_announcement", limit)
 
 
-def fetch_upbit(client: HttpClient, limit: int = 20) -> List[Dict[str, Any]]:
+def fetch_upbit(client: HttpClient, limit: int = 20) -> FetchResult:
     q = urllib.parse.urlencode(
         {"os": "web", "page": "1", "per_page": str(limit), "category": "trade"}
     )
-    code, data, t0, t1 = http_json(client, "{}?{}".format(UPBIT, q))
+    code, data, t0, t1, retry_after_s = http_json(client, "{}?{}".format(UPBIT, q))
     if code == 429:
-        raise RuntimeError("Upbit 429")
+        return _http_error("upbit", code, t0, t1, "Upbit 429", retry_after_s)
     if code != 200 or not isinstance(data, dict) or not data.get("success"):
-        raise RuntimeError("Upbit HTTP {} {}".format(code, str(data)[:180]))
+        return _http_error(
+            "upbit",
+            code,
+            t0,
+            t1,
+            "Upbit HTTP {} {}".format(code, str(data)[:180]),
+            retry_after_s,
+        )
     notices = ((data.get("data") or {}).get("notices")) or []
     out: List[Dict[str, Any]] = []
     for it in notices:
@@ -487,7 +648,7 @@ def fetch_upbit(client: HttpClient, limit: int = 20) -> List[Dict[str, Any]]:
                 t1,
             )
         )
-    return out
+    return _http_ok("upbit", out, code, t0, t1)
 
 
 def _load_cb_snap() -> Dict[str, str]:
@@ -511,12 +672,19 @@ def _save_cb_snap(snap: Dict[str, str]) -> None:
     tmp.replace(path)
 
 
-def fetch_coinbase_status(client: HttpClient) -> List[Dict[str, Any]]:
-    code, data, t0, t1 = http_json(client, CB_STATUS)
+def fetch_coinbase_status(client: HttpClient) -> FetchResult:
+    code, data, t0, t1, retry_after_s = http_json(client, CB_STATUS)
     if code == 429:
-        raise RuntimeError("Coinbase status 429")
+        return _http_error("coinbase_status", code, t0, t1, "Coinbase status 429", retry_after_s)
     if code != 200 or not isinstance(data, dict):
-        raise RuntimeError("Coinbase status HTTP {} {}".format(code, str(data)[:180]))
+        return _http_error(
+            "coinbase_status",
+            code,
+            t0,
+            t1,
+            "Coinbase status HTTP {} {}".format(code, str(data)[:180]),
+            retry_after_s,
+        )
     out: List[Dict[str, Any]] = []
     for inc in data.get("incidents") or []:
         if not isinstance(inc, dict):
@@ -538,15 +706,24 @@ def fetch_coinbase_status(client: HttpClient) -> List[Dict[str, Any]]:
                 t1,
             )
         )
-    return out
+    return _http_ok("coinbase_status", out, code, t0, t1)
 
 
-def fetch_coinbase_currencies(client: HttpClient) -> List[Dict[str, Any]]:
-    code, cur, t0, t1 = http_json(client, CB_CURRENCIES)
+def fetch_coinbase_currencies(client: HttpClient) -> FetchResult:
+    code, cur, t0, t1, retry_after_s = http_json(client, CB_CURRENCIES)
     if code == 429:
-        raise RuntimeError("Coinbase currencies 429")
+        return _http_error(
+            "coinbase_currencies", code, t0, t1, "Coinbase currencies 429", retry_after_s
+        )
     if code != 200 or not isinstance(cur, list):
-        raise RuntimeError("Coinbase currencies HTTP {} {}".format(code, str(cur)[:180]))
+        return _http_error(
+            "coinbase_currencies",
+            code,
+            t0,
+            t1,
+            "Coinbase currencies HTTP {} {}".format(code, str(cur)[:180]),
+            retry_after_s,
+        )
     now = {}
     for c in cur:
         if not isinstance(c, dict) or not c.get("id"):
@@ -555,7 +732,7 @@ def fetch_coinbase_currencies(client: HttpClient) -> List[Dict[str, Any]]:
     prev = _load_cb_snap()
     if not prev:
         _save_cb_snap(now)
-        return []
+        return _http_ok("coinbase_currencies", [], code, t0, t1)
     out: List[Dict[str, Any]] = []
     for cid, st in now.items():
         old = prev.get(cid)
@@ -603,14 +780,14 @@ def fetch_coinbase_currencies(client: HttpClient) -> List[Dict[str, Any]]:
                 )
             )
     _save_cb_snap(now)
-    return out
+    return _http_ok("coinbase_currencies", out, code, t0, t1)
 
 
 @dataclass(frozen=True)
 class Source:
     source_id: str
     venue: str
-    fetch: Callable[[HttpClient], List[Dict[str, Any]]]
+    fetch: Callable[[HttpClient], Any]
 
 
 SOURCES: Tuple[Source, ...] = (
@@ -644,14 +821,13 @@ def paper_event(item: Dict[str, Any]) -> Dict[str, Any]:
     side = classify(title, item.get("type_key") or "")
     tickers = extract_tickers(title)
     kind = infer_event_kind(item)
-    t_emit = time.monotonic()
+    t_judge = time.monotonic()
     t0 = item.get("t_http_start")
     t1 = item.get("t_http_end")
-    http_ms = None
-    process_ms = None
-    if isinstance(t0, (int, float)) and isinstance(t1, (int, float)):
-        http_ms = round((float(t1) - float(t0)) * 1000.0, 3)
-        process_ms = round((t_emit - float(t1)) * 1000.0, 3)
+    http_ms = _http_ms(t0, t1)
+    judge_ms = None
+    if isinstance(t1, (int, float)):
+        judge_ms = round((t_judge - float(t1)) * 1000.0, 3)
     if side != "SKIP" and not tickers:
         reason = "no_ticker"
         side = "SKIP"
@@ -673,7 +849,7 @@ def paper_event(item: Dict[str, Any]) -> Dict[str, Any]:
         "type_key": item.get("type_key") or "",
         "publish_ms": item.get("publish_ms"),
         "publish_time_utc": publish_time_utc(item.get("publish_ms")),
-        "timing": {"http_ms": http_ms, "process_ms": process_ms},
+        "timing": {"http_ms": http_ms, "judge_ms": judge_ms, "emit_ms": None},
     }
 
 
@@ -687,6 +863,14 @@ def _log_event(ev: Dict[str, Any]) -> None:
     line = json.dumps(ev, separators=(",", ":")) + "\n"
     with _OUT_LOCK:
         with log_path().open("a") as f:
+            f.write(line)
+
+
+def _log_cycle(rec: Dict[str, Any]) -> None:
+    cache_dir().mkdir(parents=True, exist_ok=True)
+    line = json.dumps(rec, separators=(",", ":")) + "\n"
+    with _OUT_LOCK:
+        with cycle_log_path().open("a") as f:
             f.write(line)
 
 
@@ -712,8 +896,7 @@ def ingest_source(
         ev["source_id"] = source_id
         if ev["action"] == "SKIP" and not emit_skip:
             continue
-        events.append(ev)
-        _log_event(ev)
+        t_out0 = time.monotonic()
         _print(
             "{ts} {action} {tickers} {venue} {source} {kind} {reason} {title}".format(
                 ts=ev["ts"],
@@ -726,19 +909,77 @@ def ingest_source(
                 title=ev["title"][:100],
             )
         )
-        if on_event is not None:
-            on_event(ev)
+        notify_error = None
+        try:
+            if on_event is not None:
+                on_event(ev)
+        except Exception as e:
+            notify_error = str(e)[:200]
+        timing = ev.setdefault("timing", {})
+        timing["emit_ms"] = round((time.monotonic() - t_out0) * 1000.0, 3)
+        if notify_error:
+            ev["notify_error"] = notify_error
+        events.append(ev)
+        _log_event(ev)
     if seeding:
         seen.mark_seeded(source_id)
     save_seen(seen.to_dict())
     return events
 
 
-def _safe_fetch(source: Source, client: HttpClient) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+def _safe_fetch(source: Source, client: HttpClient) -> FetchResult:
     try:
-        return source.fetch(client), None
-    except RuntimeError as e:
-        return [], str(e)
+        return coerce_fetch_result(source.source_id, source.fetch(client))
+    except Exception as e:
+        msg = str(e)[:200]
+        status = 429 if "429" in msg else None
+        return FetchResult(
+            source_id=source.source_id,
+            items=[],
+            status_code=status,
+            http_ms=None,
+            received_at=time.monotonic(),
+            error=msg,
+            retry_after_s=None,
+        )
+
+
+def _cycle_record(
+    *,
+    source_id: str,
+    venue: str,
+    result: FetchResult,
+    fetched: int,
+    new_actionable: int,
+    logged: int,
+    seeded: bool,
+    cycle_elapsed_s: float,
+    start_interval_s: Optional[float],
+    consecutive_errors: int,
+    next_wait_s: Optional[float],
+    paused: bool = False,
+    notify_errors: int = 0,
+) -> Dict[str, Any]:
+    return {
+        "kind": "cycle",
+        "ts": utc_now(),
+        "source_id": source_id,
+        "venue": venue,
+        "fetched": fetched,
+        "new_actionable": new_actionable,
+        "logged": logged,
+        "status_code": result.status_code,
+        "http_ms": result.http_ms,
+        "error": result.error,
+        "retry_after_s": result.retry_after_s,
+        "seeded": int(seeded),
+        "cycle_elapsed_s": round(cycle_elapsed_s, 3),
+        "start_interval_s": None if start_interval_s is None else round(start_interval_s, 3),
+        "consecutive_errors": consecutive_errors,
+        "next_wait_s": None if next_wait_s is None else round(next_wait_s, 3),
+        "paused": int(paused),
+        "notify_errors": notify_errors,
+    }
 
 
 def run_scheduler(
@@ -755,7 +996,9 @@ def run_scheduler(
     state = seen if seen is not None else SeenState.from_dict(load_seen())
     remaining = {s.source_id: loops for s in srcs}
     next_due = {s.source_id: 0.0 for s in srcs}
-    in_flight: Dict[str, Tuple[Future, float, Source]] = {}
+    last_started: Dict[str, float] = {}
+    consecutive_errors = {s.source_id: 0 for s in srcs}
+    in_flight: Dict[str, Tuple[Future, float, Source, Optional[float]]] = {}
     all_events: List[Dict[str, Any]] = []
     workers = max(1, len(srcs))
     with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -765,8 +1008,11 @@ def run_scheduler(
                 if remaining[s.source_id] <= 0 or s.source_id in in_flight:
                     continue
                 if now >= next_due[s.source_id]:
+                    prev = last_started.get(s.source_id)
+                    start_interval = None if prev is None else now - prev
                     fut = ex.submit(_safe_fetch, s, client)
-                    in_flight[s.source_id] = (fut, now, s)
+                    in_flight[s.source_id] = (fut, now, s, start_interval)
+                    last_started[s.source_id] = now
                     remaining[s.source_id] -= 1
                     next_due[s.source_id] = now + interval
             if not in_flight:
@@ -791,33 +1037,88 @@ def run_scheduler(
             if not done:
                 continue
             finished = []
-            for sid, (fut, started, src) in list(in_flight.items()):
+            for sid, (fut, started, src, start_interval) in list(in_flight.items()):
                 if fut in done:
-                    finished.append((sid, fut, started, src))
-            for sid, fut, started, src in finished:
+                    finished.append((sid, fut, started, src, start_interval))
+            for sid, fut, started, src, start_interval in finished:
                 del in_flight[sid]
-                items, err = fut.result()
-                http_ms = None
-                if items:
-                    t0 = items[0].get("t_http_start")
-                    t1 = items[0].get("t_http_end")
-                    if isinstance(t0, (int, float)) and isinstance(t1, (int, float)):
-                        http_ms = round((float(t1) - float(t0)) * 1000.0, 3)
-                if err:
-                    _print("skip {}: {}".format(sid, err))
+                result = fut.result()
+                received_at = result.received_at if result.received_at is not None else time.monotonic()
+                cycle_elapsed_s = time.monotonic() - started
+                next_wait_s = None
+                if result.error:
+                    consecutive_errors[sid] += 1
+                    paused = should_pause_retry_after(result.retry_after_s)
+                    next_wait_s = None
+                    if paused:
+                        remaining[sid] = 0
+                    else:
+                        due = schedule_next_due(
+                            started,
+                            received_at,
+                            interval,
+                            consecutive_errors[sid],
+                            result.retry_after_s,
+                        )
+                        next_due[sid] = due
+                        next_wait_s = due - started
+                    rec = _cycle_record(
+                        source_id=sid,
+                        venue=src.venue,
+                        result=result,
+                        fetched=len(result.items),
+                        new_actionable=0,
+                        logged=0,
+                        seeded=state.is_seeded(sid),
+                        cycle_elapsed_s=cycle_elapsed_s,
+                        start_interval_s=start_interval,
+                        consecutive_errors=consecutive_errors[sid],
+                        next_wait_s=next_wait_s,
+                        paused=paused,
+                    )
+                    _log_cycle(rec)
+                    _print(
+                        "source {} fetched=0 new_actionable=0 logged=0 http_ms={} status={} seeded={} cycle_elapsed_s={} start_interval_s={} error={}".format(
+                            sid,
+                            rec["http_ms"],
+                            rec["status_code"],
+                            rec["seeded"],
+                            rec["cycle_elapsed_s"],
+                            rec["start_interval_s"] if rec["start_interval_s"] is not None else "-",
+                            result.error,
+                        )
+                    )
                     continue
-                events = ingest_source(sid, items, state, emit_skip, on_event)
+                consecutive_errors[sid] = 0
+                events = ingest_source(sid, result.items, state, emit_skip, on_event)
                 all_events.extend(events)
                 actionable = [e for e in events if e["action"] in ("BUY", "SELL")]
+                rec = _cycle_record(
+                    source_id=sid,
+                    venue=src.venue,
+                    result=result,
+                    fetched=len(result.items),
+                    new_actionable=len(actionable),
+                    logged=len(events),
+                    seeded=state.is_seeded(sid),
+                    cycle_elapsed_s=time.monotonic() - started,
+                    start_interval_s=start_interval,
+                    consecutive_errors=0,
+                    next_wait_s=interval,
+                    notify_errors=sum(1 for e in events if e.get("notify_error")),
+                )
+                _log_cycle(rec)
                 _print(
-                    "source {} fetched={} new_actionable={} logged={} http_ms={} seeded={} start_gap_s={}".format(
+                    "source {} fetched={} new_actionable={} logged={} http_ms={} status={} seeded={} cycle_elapsed_s={} start_interval_s={}".format(
                         sid,
-                        len(items),
-                        len(actionable),
-                        len(events),
-                        http_ms,
-                        int(state.is_seeded(sid)),
-                        round(time.monotonic() - started, 3),
+                        rec["fetched"],
+                        rec["new_actionable"],
+                        rec["logged"],
+                        rec["http_ms"],
+                        rec["status_code"],
+                        rec["seeded"],
+                        rec["cycle_elapsed_s"],
+                        rec["start_interval_s"] if rec["start_interval_s"] is not None else "-",
                     )
                 )
     return all_events
@@ -986,6 +1287,7 @@ def main() -> int:
             )
         )
         _print("log {}".format(log_path()))
+        _print("cycles {}".format(cycle_log_path()))
         _print("seen {}".format(seen_path()))
     finally:
         close = getattr(client, "close", None)
