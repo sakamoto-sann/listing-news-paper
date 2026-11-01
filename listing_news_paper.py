@@ -914,7 +914,7 @@ def ingest_source(
             if on_event is not None:
                 on_event(ev)
         except Exception as e:
-            notify_error = str(e)[:200]
+            notify_error = str(e)[:200] or type(e).__name__
         timing = ev.setdefault("timing", {})
         timing["emit_ms"] = round((time.monotonic() - t_out0) * 1000.0, 3)
         if notify_error:
@@ -927,12 +927,21 @@ def ingest_source(
     return events
 
 
+def _exception_status(e: BaseException) -> Optional[int]:
+    """Read an HTTP status from the exception itself, never from its message text."""
+    for obj in (e, getattr(e, "response", None)):
+        code = getattr(obj, "status_code", None)
+        if isinstance(code, int) and 100 <= code <= 599:
+            return code
+    return None
+
+
 def _safe_fetch(source: Source, client: HttpClient) -> FetchResult:
     try:
         return coerce_fetch_result(source.source_id, source.fetch(client))
     except Exception as e:
-        msg = str(e)[:200]
-        status = 429 if "429" in msg else None
+        msg = str(e)[:200] or type(e).__name__
+        status = _exception_status(e)
         return FetchResult(
             source_id=source.source_id,
             items=[],
@@ -1061,7 +1070,7 @@ def run_scheduler(
                             result.retry_after_s,
                         )
                         next_due[sid] = due
-                        next_wait_s = due - started
+                        next_wait_s = max(0.0, due - time.monotonic())
                     rec = _cycle_record(
                         source_id=sid,
                         venue=src.venue,
@@ -1104,7 +1113,7 @@ def run_scheduler(
                     cycle_elapsed_s=time.monotonic() - started,
                     start_interval_s=start_interval,
                     consecutive_errors=0,
-                    next_wait_s=interval,
+                    next_wait_s=max(0.0, next_due[sid] - time.monotonic()),
                     notify_errors=sum(1 for e in events if e.get("notify_error")),
                 )
                 _log_cycle(rec)

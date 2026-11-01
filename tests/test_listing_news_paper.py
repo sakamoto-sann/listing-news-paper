@@ -5,6 +5,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -555,13 +556,16 @@ class CycleMetricsTests(unittest.TestCase):
         sources = [_source("bybit", "bybit", boom)]
         seen = m.SeenState(seeded=["bybit"])
         t0 = time.monotonic()
-        m.run_scheduler(
-            loops=3,
-            interval=0.04,
-            emit_skip=False,
-            sources=sources,
-            seen=seen,
+        # Run in a daemon thread so a pause regression fails fast instead of
+        # sleeping for the full 99,999-second Retry-After.
+        runner = threading.Thread(
+            target=m.run_scheduler,
+            kwargs=dict(loops=3, interval=0.04, emit_skip=False, sources=sources, seen=seen),
+            daemon=True,
         )
+        runner.start()
+        runner.join(timeout=5.0)
+        self.assertFalse(runner.is_alive(), "scheduler waited on Retry-After instead of pausing")
         elapsed = time.monotonic() - t0
         self.assertEqual(calls["n"], 1)
         self.assertLess(elapsed, 1.0)
@@ -570,6 +574,38 @@ class CycleMetricsTests(unittest.TestCase):
         self.assertEqual(recs[0]["retry_after_s"], 99999.0)
         self.assertEqual(recs[0]["paused"], 1)
         self.assertIsNone(recs[0]["next_wait_s"])
+
+    def test_safe_fetch_status_comes_from_exception_not_message(self) -> None:
+        def boom(_client):
+            raise RuntimeError("payload id 4299 contains 429")
+
+        res = m._safe_fetch(_source("bybit", "bybit", boom), None)
+        self.assertIsNone(res.status_code)
+
+        class Resp:
+            status_code = 429
+
+        class HttpErr(Exception):
+            response = Resp()
+
+        def boom2(_client):
+            raise HttpErr("")
+
+        res = m._safe_fetch(_source("bybit", "bybit", boom2), None)
+        self.assertEqual(res.status_code, 429)
+        self.assertEqual(res.error, "HttpErr")
+
+    def test_next_wait_s_excludes_time_spent_in_cycle(self) -> None:
+        def slow(_client):
+            time.sleep(0.15)
+            return m.FetchResult("bybit", [], 200, 1.0, time.monotonic(), None, None)
+
+        sources = [_source("bybit", "bybit", slow)]
+        seen = m.SeenState(seeded=["bybit"])
+        m.run_scheduler(loops=1, interval=0.5, emit_skip=False, sources=sources, seen=seen)
+        recs = self._cycles()
+        self.assertEqual(len(recs), 1)
+        self.assertLess(recs[0]["next_wait_s"], 0.4)
 
     def test_http_error_keeps_hour_retry_after(self) -> None:
         rec = m._http_error("bybit", 429, 1.0, 1.2, "Bybit 429", 3600.0)
